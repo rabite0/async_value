@@ -136,7 +136,7 @@ pub type AsyncReadyMoveFn<T> =
     Box<dyn FnOnce(CResult<T>, &Stale) -> CResult<()> + Send + Sync>;
 
 #[derive(Clone)]
-pub struct Async<T: Clone + Send + 'static> {
+pub struct Async<T: Send + 'static> {
     pub value: AResult<T>,
     async_value: AsyncValue<T>,
     async_closure: Arc<Mutex<Option<AsyncValueFn<T>>>>,
@@ -150,7 +150,7 @@ pub struct Async<T: Clone + Send + 'static> {
 
 
 
-impl<T: Clone + Send + 'static> Async<T> {
+impl<T: Send + 'static> Async<T> {
     pub fn new(closure: AsyncValueFn<T>)
                   -> Async<T> {
         let async_value = Async {
