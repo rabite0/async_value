@@ -1,0 +1,1 @@
+Simple asynchronous values. You provide a closure that computes a value and then either run it synchronously, in a regular thread, or in a thread pool.
