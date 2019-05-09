@@ -5,6 +5,7 @@ extern crate failure;
 extern crate rayon;
 #[macro_use]
 extern crate lazy_static;
+extern crate objekt;
 
 
 
@@ -19,15 +20,14 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use failure::{Fail, Error};
 use failure::Backtrace;
 
+
+
 lazy_static! {
     static ref POOL: RwLock<Option<ThreadPool>> = RwLock::new(ThreadPoolBuilder::new()
         .num_threads(8)
         .build()
         .ok());
 }
-
-
-
 
 
 #[derive(Debug, Clone)]
@@ -48,7 +48,6 @@ impl ArcBacktrace {
 
 #[derive(Debug, Clone)]
 pub enum AError {
-    AsyncReady,
     AsyncNotReady(ArcBacktrace),
     AsyncRunning(ArcBacktrace),
     AsyncFailed(ArcBacktrace),
@@ -57,15 +56,16 @@ pub enum AError {
     AsyncValueMoved(ArcBacktrace),
     AsyncValueEmpty(ArcBacktrace),
     NoValueFn(ArcBacktrace),
+    NoReadyFn(ArcBacktrace),
     MutexPoisoned(ArcBacktrace),
     NoThreadPool(ArcBacktrace),
-    ClosureFailed(ArcBacktrace, Arc<Error>),
+    OtherError(ArcBacktrace, Arc<Error>)
 }
 
 impl From<Error> for AError {
     fn from(err: Error) -> Self {
-        AError::ClosureFailed(ArcBacktrace::new(),
-                              Arc::new(err))
+        AError::OtherError(ArcBacktrace::new(),
+                           Arc::new(err))
     }
 }
 
@@ -80,10 +80,10 @@ impl Fail for AError {
             AError::AsyncValueMoved(bt) => bt.backtrace(),
             AError::AsyncValueEmpty(bt) => bt.backtrace(),
             AError::NoValueFn(bt) => bt.backtrace(),
+            AError::NoReadyFn(bt) => bt.backtrace(),
             AError::MutexPoisoned(bt) => bt.backtrace(),
             AError::NoThreadPool(bt) => bt.backtrace(),
-            AError::ClosureFailed(bt, _) => bt.backtrace(),
-            _ => None
+            AError::OtherError(bt, _) => bt.backtrace()
         }
     }
 }
@@ -100,9 +100,6 @@ impl<T> From<std::sync::PoisonError<T>> for AError {
         err
     }
 }
-
-
-
 
 
 impl AError {
@@ -127,6 +124,9 @@ impl AError {
     pub fn no_value_fn() -> AError {
         AError::NoValueFn(ArcBacktrace::new())
     }
+    pub fn no_ready_fn() -> AError {
+        AError::NoValueFn(ArcBacktrace::new())
+    }
     pub fn mutex_poisoned() -> AError {
         AError::MutexPoisoned(ArcBacktrace::new())
     }
@@ -142,89 +142,116 @@ pub type AResult<T> = Result<T, AError>;
 pub type CResult<T> = Result<T, Error>;
 
 pub type AsyncValue<T> = Arc<Mutex<Option<AResult<T>>>>;
-pub type AsyncValueFn<T> = Box<dyn FnOnce(&Stale)
-                                          -> CResult<T> + Send + Sync>;
-pub type AsyncReadyFn = Box<dyn FnOnce(&Stale) -> CResult<()> + Send + Sync> ;
 
-pub type AsyncReadyRefFn<T> =
-    Box<dyn FnOnce(Result<&T, &AError>, &Stale)
-                  -> CResult<()> + Send + Sync>;
-
-pub type AsyncReadyRefMutFn<T> =
-    Box<dyn FnOnce(Result<&mut T, &mut AError>, &Stale)
-                  -> CResult<()> + Send + Sync>;
-
-pub type AsyncReadyMoveFn<T> =
-    Box<dyn FnOnce(AResult<T>, &Stale) -> AResult<()> + Send + Sync>;
+pub trait AsyncValueFnBox: objekt::Clone + Send {
+    type Output;
+    fn call(&mut self,
+            stale: &Stale) -> AResult<Self::Output>;
+}
 
 
+trait OnReadyFnBox: objekt::Clone + Send {
+    type Input;
+    fn call(&mut self,
+            value: Result<&mut Self::Input, &mut AError>,
+            stale: &Stale) -> AResult<()>;
+}
 
+objekt::clone_trait_object!(<T> AsyncValueFnBox<Output=T>);
+objekt::clone_trait_object!(<T> OnReadyFnBox<Input=T>);
 
 
 #[derive(Clone)]
-pub struct Async<T: Send + 'static> {
+struct AsyncValueFn<T, F>
+where
+    T: Send + 'static,
+    F: FnOnce(&Stale) -> CResult<T> + Send + 'static
+{
+    fun: Option<F>
+}
+
+
+#[derive(Clone)]
+struct OnReadyFn<T, F>
+where
+    T: Send + 'static,
+    F: FnOnce(Result<&mut T, &mut AError>, &Stale) -> CResult<()> + Send + 'static
+{
+    fun: Option<F>,
+    mark: std::marker::PhantomData<T>
+}
+
+
+impl<T, F> AsyncValueFnBox for AsyncValueFn<T, F>
+where
+    T: Clone + Send,
+    F: FnOnce(&Stale) -> CResult<T> + Clone + Send
+{
+    type Output = T;
+    fn call(&mut self,
+            stale: &Stale) -> AResult<T> {
+        let fun = self.fun.take();
+        if let Some(fun) = fun {
+            Ok(fun(stale)?)
+        } else { Err(AError::no_value_fn()) }
+    }
+}
+
+impl<T, F> OnReadyFnBox for OnReadyFn<T, F>
+where
+    T: Clone + Send,
+    F: FnOnce(Result<&mut T, &mut AError>, &Stale) -> CResult<()> + Clone + Send
+{
+    type Input = T;
+    fn call(&mut self,
+            value: Result<&mut T, &mut AError>,
+            stale: &Stale) -> AResult<()> {
+        let fun = self.fun.take();
+        if let Some(fun) = fun {
+            Ok(fun(value, stale)?)
+        } else { Err(AError::no_ready_fn()) }
+    }
+}
+
+
+#[derive(Clone)]
+pub struct Async<T: Clone + Send + 'static>
+where
+    Option<Box<AsyncValueFnBox<Output=T>>>: Clone
+{
     pub value: AResult<T>,
     async_value: AsyncValue<T>,
-    async_closure: Arc<Mutex<Option<AsyncValueFn<T>>>>,
-    on_ready: Arc<Mutex<Option<AsyncReadyFn>>>,
-    on_ready_ref: Arc<Mutex<Option<AsyncReadyRefFn<T>>>>,
-    on_ready_ref_mut: Arc<Mutex<Option<AsyncReadyRefMutFn<T>>>>,
-    on_ready_move: Arc<Mutex<Option<AsyncReadyMoveFn<T>>>>,
+    async_closure: Option<Box<AsyncValueFnBox<Output=T>>>,
+    on_ready: Arc<Mutex<Vec<Box<OnReadyFnBox<Input=T>>>>>,
     state: Arc<Mutex<State>>,
     stale: Stale
 }
-
-// trait CloneAsync<T: Clone + Send> {
-//     fn cloned(&self) -> Async<T>;
-// }
-
-// impl<T: Clone + Send> CloneAsync<T> for Async<T> {
-//     fn cloned(&self) -> Async<T> {
-//         self.clone()
-//     }
-// }
-
-// trait CloneFn<T: Clone + Send + 'static>  {
-//     fn cloned(&self) -> AsyncReadyFn;
-// }
-
-// impl<T: Clone + Send + 'static> CloneFn<T> for AsyncReadyFn {
-//     fn cloned(&self) -> AsyncReadyFn {
-//         let wut = Box::new(self);
-//         let new: Box<dyn FnOnce(&Stale) -> CResult<()> + Send + Sync + 'static>
-//             = Box::new(move |stale| wut(&stale));
-//         new
-//     }
-// }
 
 #[derive(Copy, Clone, Debug)]
 pub enum State {
     Sleeping,
     Running,
+    OnReady,
     Ready,
     Failed,
     Taken
 }
 
 
-impl<T: Send + 'static> Async<T>
+impl<T: Clone + Send + 'static> Async<T>
 where
-    AsyncValueFn<T>: Clone,
-    AsyncReadyFn: Clone,
-    AsyncReadyRefFn<T>: Clone,
-    AsyncReadyRefMutFn<T>: Clone,
-    AsyncReadyMoveFn<T>: Clone,
+    Option<Box<AsyncValueFnBox<Output=T>>>: Clone
 {
-    pub fn new(closure: AsyncValueFn<T>)
-                  -> Async<T> {
+    pub fn new(closure: impl FnOnce(&Stale) -> CResult<T> + Clone + Send + 'static)
+               -> Async<T> {
+        let closure: Box<AsyncValueFnBox<Output=T>>
+            = Box::new(AsyncValueFn { fun: Some(closure)});
+
         let async_value = Async {
             value: Err(AError::async_not_ready()),
             async_value: Arc::new(Mutex::new(None)),
-            async_closure: Arc::new(Mutex::new(Some(closure))),
-            on_ready: Arc::new(Mutex::new(None)),
-            on_ready_ref: Arc::new(Mutex::new(None)),
-            on_ready_ref_mut: Arc::new(Mutex::new(None)),
-            on_ready_move: Arc::new(Mutex::new(None)),
+            async_closure: Some(closure),
+            on_ready: Arc::new(Mutex::new(vec![])),
             state: Arc::new(Mutex::new(State::Sleeping)),
             stale: Stale::new() };
 
@@ -235,11 +262,8 @@ where
         Async {
             value: Ok(val),
             async_value: Arc::new(Mutex::new(None)),
-            async_closure: Arc::new(Mutex::new(None)),
-            on_ready: Arc::new(Mutex::new(None)),
-            on_ready_ref: Arc::new(Mutex::new(None)),
-            on_ready_ref_mut: Arc::new(Mutex::new(None)),
-            on_ready_move: Arc::new(Mutex::new(None)),
+            async_closure: None,
+            on_ready: Arc::new(Mutex::new(vec![])),
             state: Arc::new(Mutex::new(State::Ready)),
             stale: Stale::new()
         }
@@ -247,108 +271,67 @@ where
 
     pub fn run_sync(self) -> AResult<T> {
         let value = self.async_value.clone();
-        let state = self.state.clone();
+        let closure = self
+            .async_closure
+            .ok_or_else(|| AError::no_value_fn())?;
 
-        state.lock().map(|mut state| *state = State::Running).ok();
-
-        Async::run_closure(self.async_closure,
+        Async::run_closure(closure,
                            self.async_value,
                            self.on_ready,
-                           self.on_ready_ref,
-                           self.on_ready_ref_mut,
-                           self.on_ready_move,
                            self.state,
                            self.stale)?;
 
         let mut value = value.lock()?;
-        let value = value.take()
-            .unwrap_or_else(||Err(AError::async_empty()));
-
-
-        if value.is_ok() {
-            state.lock().map(|mut state| *state = State::Ready).ok();
-        } else {
-            state.lock().map(|mut state| *state = State::Failed).ok();
-        }
+        let value = value
+            .take()
+            .unwrap_or_else(|| Err(AError::async_empty()));
 
         value
     }
 
-    pub fn run_closure(async_closure: Arc<Mutex<Option<AsyncValueFn<T>>>>,
-                       async_value: AsyncValue<T>,
-                       on_ready: Arc<Mutex<Option<AsyncReadyFn>>>,
-                       on_ready_ref: Arc<Mutex<Option<AsyncReadyRefFn<T>>>>,
-                       on_ready_ref_mut: Arc<Mutex<Option<AsyncReadyRefMutFn<T>>>>,
-                       on_ready_move: Arc<Mutex<Option<AsyncReadyMoveFn<T>>>>,
-                       state: Arc<Mutex<State>>,
-                       stale: Stale) -> AResult<()> {
-        let closure = async_closure.lock()?;
-        let closure = match *closure {
-            Some(ref closure) => {
-                Ok(closure.clone())
-            },
-            None =>{
-                Err(AError::no_value_fn())
-            }
-        }?;
+    fn run_closure(mut async_closure: Box<AsyncValueFnBox<Output=T>>,
+                   async_value: AsyncValue<T>,
+                   on_ready: Arc<Mutex<Vec<Box<OnReadyFnBox<Input=T>>>>>,
+                   state: Arc<Mutex<State>>,
+                   stale: Stale) -> AResult<()> {
+        state.lock().map(|mut state| *state = State::Running).ok();
 
+        let value: AResult<T> = async_closure.call(&stale).map_err(|e| e.into());
 
-        let mut value = closure(&stale).map_err(|e| e.into());
-
-        match value {
-            Ok(_) => state.lock().map(|mut state| *state = State::Ready).ok(),
-            Err(_) => state.lock().map(|mut state| *state = State::Failed).ok()
-        };
-
-
-
-        {
-            let value_ref = &value;
-            on_ready_ref
-                .lock()
-                .map_err(|_| AError::mutex_poisoned())
-                .map(|mut on_ready_ref| {
-                    on_ready_ref.take().map(|on_ready_ref| {
-                        on_ready_ref(value_ref.as_ref(),
-                                     &stale).ok();
-                    });
-                }).ok();
-        }
-
-        {
-            let value_ref_mut = &mut value;
-            on_ready_ref_mut
-                .lock()
-                .map_err(|_| AError::mutex_poisoned())
-                .map(|mut on_ready_ref_mut| {
-                    on_ready_ref_mut.take().map(|on_ready_ref_mut| {
-                        on_ready_ref_mut(value_ref_mut.as_mut(),
-                                         &stale).ok();
-                    });
-                }).ok();
-        }
-
-
-        on_ready_move
+        async_value
             .lock()
             .map_err(|_| AError::mutex_poisoned())
-            .map(|mut on_ready_move| {
-                on_ready_move.take().map(|on_ready_move| {
-                    async_value.lock().map(|mut async_value| {
-                        let move_err = Err(AError::async_moved());
-                        let value = async_value.replace(move_err);
-                        value.map(|value| on_ready_move(value.map_err(|e| e.into()),
-                                                                      &stale).ok());
-                    }).ok();
-                });
+            .map(|mut val| {
+                val.replace(value.map_err(|e| e.into()));
+
+                state.lock().map(|mut state| *state = State::OnReady).ok();
+
+                while let Ok(mut fun) = on_ready
+                    .lock()
+                    .map_err(|_| AError::mutex_poisoned())
+                    .and_then(|mut funs| {
+                        if funs.len() > 0 {
+                            Ok(funs.remove(0))
+                        } else { Err(AError::no_ready_fn()) }
+                    }) {
+                        val.as_mut().map(|val|
+                                         fun.call(val.as_mut(),
+                                                  &stale).ok());
+
+                        // Hack to synchronize with chain_on_ready
+                        state.lock().ok();
+                    };
+
+
+                match *val {
+                    Some(Ok(_)) => {
+                        state
+                            .lock()
+                            .map(|mut state| *state = State::Ready).ok()
+                    },
+                    _ => state.lock().map(|mut state| *state = State::Failed).ok()
+                }
             }).ok();
-
-
-        // Plain old on-ready callback without access to value
-        async_value.lock()?.replace(value.map_err(|e| e.into()));
-        on_ready.lock()?
-            .take()
-            .map(|on_ready| on_ready(&stale).ok());
 
         Ok(())
     }
@@ -363,22 +346,21 @@ where
         }
 
 
-        let closure = self.async_closure.clone();
+        let closure = self
+            .async_closure
+            .take()
+            .ok_or_else(|| AError::no_value_fn())?;
         let async_value = self.async_value.clone();
         let stale = self.stale.clone();
         let on_ready = self.on_ready.clone();
-        let on_ready_ref = self.on_ready_ref.clone();
-        let on_ready_ref_mut = self.on_ready_ref_mut.clone();
-        let on_ready_move = self.on_ready_move.clone();
         let state = self.state.clone();
+
+
 
         std::thread::spawn(move || {
             Async::run_closure(closure,
                                async_value,
                                on_ready,
-                               on_ready_ref,
-                               on_ready_ref_mut,
-                               on_ready_move,
                                state,
                                stale).ok();
         });
@@ -397,40 +379,26 @@ where
             Err(AError::async_stale())?
         }
 
-        let closure = self.async_closure.clone();
+        let closure = self
+            .async_closure
+            .take().clone()
+            .ok_or_else(|| AError::no_value_fn())?;
         let async_value = self.async_value.clone();
         let stale = self.stale.clone();
         let on_ready = self.on_ready.clone();
-        let on_ready_ref = self.on_ready_ref.clone();
-        let on_ready_ref_mut = self.on_ready_ref_mut.clone();
-        let on_ready_move = self.on_ready_move.clone();
         let state = self.state.clone();
 
-        let run = || Async::run_closure(closure,
-                                        async_value,
-                                        on_ready,
-                                        on_ready_ref,
-                                        on_ready_ref_mut,
-                                        on_ready_move,
-                                        state,
-                                        stale).ok();
+        let pool = pool.ok_or_else(|| POOL.read())
+            .map(|pool| pool)
+            .map_err(|_| AError::no_thread_pool())?;
 
-        match pool {
-            Some(pool) => {
-                pool.spawn(move || {
-                    run();
-                });
-            }
-            None => {
-                let pool = POOL.read()?;
-                match pool.as_ref() {
-                    Some(pool) => pool.spawn(move || { run(); }),
-                    None => Err(AError::no_thread_pool())?
-                }
-            }
-        }
-
-        self.set_running();
+        pool.spawn(move || {
+            Async::run_closure(closure,
+                               async_value,
+                               on_ready,
+                               state,
+                               stale).ok();
+        });
 
         Ok(())
     }
@@ -510,7 +478,11 @@ where
     pub fn pull_async(&mut self) -> AResult<()> {
         if self.value.is_ok() { Err(AError::async_pulled())? }
 
-        let mut async_value = self.async_value.lock()?;
+
+        let mut async_value = self.async_value.try_lock()
+            .map_err(|_| AError::async_not_ready() )
+            .unwrap();
+
         match async_value.as_ref() {
             Some(Ok(_)) => {
                 let value = async_value.take()
@@ -526,6 +498,8 @@ where
             }
             None => Err(AError::async_not_ready())?,
         }
+
+        self.state.lock().map(|mut s| *s = State::Taken).ok();
         Ok(())
     }
 
@@ -543,70 +517,39 @@ where
         }
     }
 
-    pub fn on_ready(&self,
-                    fun: AsyncReadyFn) -> AResult<()> {
-        if self.is_ready() {
-            *self.on_ready.lock().unwrap() = Some(fun.clone());
+    pub fn on_ready(&mut self,
+                    fun: impl FnOnce(Result<&mut T,
+                                            &mut AError>, &Stale)
+                                     -> CResult<()> + Send + Clone + 'static)
+                    -> AResult<()> {
+        let state = self.state.lock()?;
 
-            fun(&self.stale)?;
-        } else {
-            *self.on_ready.lock().unwrap() = Some(fun);
+        match *state {
+            State::Sleeping | State::Running | State::OnReady => {
+                let on_ready = OnReadyFn {
+                    fun: Some(fun),
+                    mark: std::marker::PhantomData::<T>
+                };
+
+                self.on_ready
+                    .lock()
+                    .map(|mut on_ready_funs|
+                         on_ready_funs.push(Box::new(on_ready)))
+                    .ok();
+            },
+            State::Ready | State::Failed => {
+                self.async_value.lock()?
+                    .as_mut()
+                    .ok_or(AError::async_empty())
+                    .map(|value|
+                         fun(value.as_mut(), &self.stale))?.ok();
+            },
+            State::Taken => {
+                fun(self.value.as_mut(), &self.stale)?;
+            },
         }
 
         Ok(())
-    }
-
-    pub fn on_ready_ref(&mut self,
-                    fun: AsyncReadyRefFn<T>) {
-        if self.is_ready() {
-            *self.on_ready_ref.lock().unwrap() = Some(fun.clone());
-
-            self.pull_async().ok();
-            fun(self.value.as_ref().into(), &self.stale).ok();
-        } else {
-            *self.on_ready_ref.lock().unwrap() = Some(fun);
-        }
-    }
-
-    pub fn on_ready_mut(&mut self,
-                    fun: AsyncReadyRefMutFn<T>) {
-        if self.is_ready() {
-            *self.on_ready_ref_mut.lock().unwrap() = Some(fun.clone());
-
-            self.pull_async().ok();
-            fun(self.value.as_mut(), &self.stale).ok();
-        } else {
-            *self.on_ready_ref_mut.lock().unwrap() = Some(fun);
-        }
-    }
-
-    // We can't easily run the closure here because we need to move out the value
-    pub fn on_ready_move(&mut self,
-                         fun: AsyncReadyMoveFn<T>) {
-        *self.on_ready_move.lock().unwrap() = Some(fun.clone());
-    }
-
-    // But we can move out of the Async value and let it do its thing
-    pub fn on_ready_move_and_forget(mut self,
-                                fun: AsyncReadyMoveFn<T>) {
-        POOL.read().map(|pool| {
-            match pool.as_ref() {
-                Some(pool) => pool.spawn(move || { fun(self.value,
-                                                       &self.stale).ok(); }),
-                None => {
-                    std::thread::spawn(move || {
-                        if self.is_ready() {
-                            *self.on_ready_move.lock().unwrap() = Some(fun.clone());
-
-                            self.pull_async().ok();
-                            fun(self.value, &self.stale).ok();
-                        } else {
-                            *self.on_ready_move.lock().unwrap() = Some(fun);
-                        }
-                    });
-                }
-            }
-        }).ok();
     }
 
     pub fn set_default_thread_pool(pool: Option<ThreadPool>) -> AResult<()> {
