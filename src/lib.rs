@@ -1,6 +1,3 @@
-#![feature(trivial_bounds)]
-//#![feature(clone_closures)]
-
 extern crate failure;
 extern crate rayon;
 #[macro_use]
@@ -136,93 +133,27 @@ impl AError {
 }
 
 
-
-
 pub type AResult<T> = Result<T, AError>;
 pub type CResult<T> = Result<T, Error>;
 
 pub type AsyncValue<T> = Arc<Mutex<Option<AResult<T>>>>;
 
-pub trait AsyncValueFnBox: objekt::Clone + Send {
-    type Output;
-    fn call(&mut self,
-            stale: &Stale) -> AResult<Self::Output>;
-}
+pub type AsyncValueFn<T> = FnOnce(&Stale) -> CResult<T> + Send + 'static;
+pub type AsyncReadyFn<T> = FnOnce(Result<&mut T,
+                                         &mut AError>,
+                                  &Stale)
+                                  -> CResult<()> + Send + 'static;
 
 
-trait OnReadyFnBox: objekt::Clone + Send {
-    type Input;
-    fn call(&mut self,
-            value: Result<&mut Self::Input, &mut AError>,
-            stale: &Stale) -> AResult<()>;
-}
-
-objekt::clone_trait_object!(<T> AsyncValueFnBox<Output=T>);
-objekt::clone_trait_object!(<T> OnReadyFnBox<Input=T>);
 
 
 #[derive(Clone)]
-struct AsyncValueFn<T, F>
-where
-    T: Send + 'static,
-    F: FnOnce(&Stale) -> CResult<T> + Send + 'static
-{
-    fun: Option<F>
-}
-
-
-#[derive(Clone)]
-struct OnReadyFn<T, F>
-where
-    T: Send + 'static,
-    F: FnOnce(Result<&mut T, &mut AError>, &Stale) -> CResult<()> + Send + 'static
-{
-    fun: Option<F>,
-    mark: std::marker::PhantomData<T>
-}
-
-
-impl<T, F> AsyncValueFnBox for AsyncValueFn<T, F>
-where
-    T: Clone + Send,
-    F: FnOnce(&Stale) -> CResult<T> + Clone + Send
-{
-    type Output = T;
-    fn call(&mut self,
-            stale: &Stale) -> AResult<T> {
-        let fun = self.fun.take();
-        if let Some(fun) = fun {
-            Ok(fun(stale)?)
-        } else { Err(AError::no_value_fn()) }
-    }
-}
-
-impl<T, F> OnReadyFnBox for OnReadyFn<T, F>
-where
-    T: Clone + Send,
-    F: FnOnce(Result<&mut T, &mut AError>, &Stale) -> CResult<()> + Clone + Send
-{
-    type Input = T;
-    fn call(&mut self,
-            value: Result<&mut T, &mut AError>,
-            stale: &Stale) -> AResult<()> {
-        let fun = self.fun.take();
-        if let Some(fun) = fun {
-            Ok(fun(value, stale)?)
-        } else { Err(AError::no_ready_fn()) }
-    }
-}
-
-
-#[derive(Clone)]
-pub struct Async<T: Clone + Send + 'static>
-where
-    Option<Box<AsyncValueFnBox<Output=T>>>: Clone
+pub struct Async<T: Send + 'static>
 {
     pub value: AResult<T>,
     async_value: AsyncValue<T>,
-    async_closure: Option<Box<AsyncValueFnBox<Output=T>>>,
-    on_ready: Arc<Mutex<Vec<Box<OnReadyFnBox<Input=T>>>>>,
+    async_closure: Arc<Mutex<Option<Box<AsyncValueFn<T>>>>>,
+    on_ready: Arc<Mutex<Vec<Box<AsyncReadyFn<T>>>>>,
     state: Arc<Mutex<State>>,
     stale: Stale
 }
@@ -238,19 +169,17 @@ pub enum State {
 }
 
 
-impl<T: Clone + Send + 'static> Async<T>
-where
-    Option<Box<AsyncValueFnBox<Output=T>>>: Clone
+impl<T: Send + 'static> Async<T>
 {
-    pub fn new(closure: impl FnOnce(&Stale) -> CResult<T> + Clone + Send + 'static)
+    pub fn new(closure: impl FnOnce(&Stale) -> CResult<T> + Send + 'static)
                -> Async<T> {
-        let closure: Box<AsyncValueFnBox<Output=T>>
-            = Box::new(AsyncValueFn { fun: Some(closure)});
+        let closure: Box<AsyncValueFn<T>>
+            = Box::new(closure);
 
         let async_value = Async {
             value: Err(AError::async_not_ready()),
             async_value: Arc::new(Mutex::new(None)),
-            async_closure: Some(closure),
+            async_closure: Arc::new(Mutex::new(Some(closure))),
             on_ready: Arc::new(Mutex::new(vec![])),
             state: Arc::new(Mutex::new(State::Sleeping)),
             stale: Stale::new() };
@@ -262,7 +191,7 @@ where
         Async {
             value: Ok(val),
             async_value: Arc::new(Mutex::new(None)),
-            async_closure: None,
+            async_closure: Arc::new(Mutex::new(None)),
             on_ready: Arc::new(Mutex::new(vec![])),
             state: Arc::new(Mutex::new(State::Ready)),
             stale: Stale::new()
@@ -273,6 +202,8 @@ where
         let value = self.async_value.clone();
         let closure = self
             .async_closure
+            .lock()?
+            .take()
             .ok_or_else(|| AError::no_value_fn())?;
 
         Async::run_closure(closure,
@@ -289,14 +220,14 @@ where
         value
     }
 
-    fn run_closure(mut async_closure: Box<AsyncValueFnBox<Output=T>>,
+    fn run_closure(async_closure: Box<AsyncValueFn<T>>,
                    async_value: AsyncValue<T>,
-                   on_ready: Arc<Mutex<Vec<Box<OnReadyFnBox<Input=T>>>>>,
+                   on_ready: Arc<Mutex<Vec<Box<AsyncReadyFn<T>>>>>,
                    state: Arc<Mutex<State>>,
                    stale: Stale) -> AResult<()> {
         state.lock().map(|mut state| *state = State::Running).ok();
 
-        let value: AResult<T> = async_closure.call(&stale).map_err(|e| e.into());
+        let value: AResult<T> = async_closure(&stale).map_err(|e| e.into());
 
         async_value
             .lock()
@@ -306,7 +237,7 @@ where
 
                 state.lock().map(|mut state| *state = State::OnReady).ok();
 
-                while let Ok(mut fun) = on_ready
+                while let Ok(fun) = on_ready
                     .lock()
                     .map_err(|_| AError::mutex_poisoned())
                     .and_then(|mut funs| {
@@ -315,8 +246,8 @@ where
                         } else { Err(AError::no_ready_fn()) }
                     }) {
                         val.as_mut().map(|val|
-                                         fun.call(val.as_mut(),
-                                                  &stale).ok());
+                                         fun(val.as_mut(),
+                                             &stale).ok());
 
                         // Hack to synchronize with chain_on_ready
                         state.lock().ok();
@@ -348,6 +279,7 @@ where
 
         let closure = self
             .async_closure
+            .lock()?
             .take()
             .ok_or_else(|| AError::no_value_fn())?;
         let async_value = self.async_value.clone();
@@ -381,7 +313,8 @@ where
 
         let closure = self
             .async_closure
-            .take().clone()
+            .lock()?
+            .take()
             .ok_or_else(|| AError::no_value_fn())?;
         let async_value = self.async_value.clone();
         let stale = self.stale.clone();
@@ -520,16 +453,13 @@ where
     pub fn on_ready(&mut self,
                     fun: impl FnOnce(Result<&mut T,
                                             &mut AError>, &Stale)
-                                     -> CResult<()> + Send + Clone + 'static)
+                                     -> CResult<()> + Send + 'static)
                     -> AResult<()> {
         let state = self.state.lock()?;
 
         match *state {
             State::Sleeping | State::Running | State::OnReady => {
-                let on_ready = OnReadyFn {
-                    fun: Some(fun),
-                    mark: std::marker::PhantomData::<T>
-                };
+                let on_ready = Box::new(fun);
 
                 self.on_ready
                     .lock()
