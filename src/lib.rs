@@ -45,6 +45,7 @@ impl ArcBacktrace {
 
 #[derive(Debug, Clone)]
 pub enum AError {
+    AsyncNotStarted,
     AsyncNotReady(ArcBacktrace),
     AsyncRunning(ArcBacktrace),
     AsyncFailed(ArcBacktrace),
@@ -69,6 +70,7 @@ impl From<Error> for AError {
 impl Fail for AError {
     fn backtrace(&self) -> Option<&Backtrace> {
         match self {
+            AError::AsyncNotStarted => None,
             AError::AsyncNotReady(bt) => bt.backtrace(),
             AError::AsyncRunning(bt) => bt.backtrace(),
             AError::AsyncFailed(bt) => bt.backtrace(),
@@ -140,7 +142,7 @@ pub type AsyncValue<T> = Arc<Mutex<Option<AResult<T>>>>;
 
 pub type AsyncValueFn<T> = FnOnce(&Stale) -> CResult<T> + Send + 'static;
 pub type AsyncReadyFn<T> = FnOnce(Result<&mut T,
-                                         &mut AError>,
+                                         AError>,
                                   &Stale)
                                   -> CResult<()> + Send + 'static;
 
@@ -177,7 +179,7 @@ impl<T: Send + 'static> Async<T>
             = Box::new(closure);
 
         let async_value = Async {
-            value: Err(AError::async_not_ready()),
+            value: Err(AError::AsyncNotStarted),
             async_value: Arc::new(Mutex::new(None)),
             async_closure: Arc::new(Mutex::new(Some(closure))),
             on_ready: Arc::new(Mutex::new(vec![])),
@@ -246,7 +248,7 @@ impl<T: Send + 'static> Async<T>
                         } else { Err(AError::no_ready_fn()) }
                     }) {
                         val.as_mut().map(|val|
-                                         fun(val.as_mut(),
+                                         fun(val.cloned_err(),
                                              &stale).ok());
 
                         // Hack to synchronize with chain_on_ready
@@ -413,8 +415,8 @@ impl<T: Send + 'static> Async<T>
 
 
         let mut async_value = self.async_value.try_lock()
-            .map_err(|_| AError::async_not_ready() )
-            .unwrap();
+            .map_err(|_| AError::async_not_ready() )?;
+
 
         match async_value.as_ref() {
             Some(Ok(_)) => {
@@ -452,7 +454,7 @@ impl<T: Send + 'static> Async<T>
 
     pub fn on_ready(&mut self,
                     fun: impl FnOnce(Result<&mut T,
-                                            &mut AError>, &Stale)
+                                            AError>, &Stale)
                                      -> CResult<()> + Send + 'static)
                     -> AResult<()> {
         let state = self.state.lock()?;
@@ -472,10 +474,10 @@ impl<T: Send + 'static> Async<T>
                     .as_mut()
                     .ok_or(AError::async_empty())
                     .map(|value|
-                         fun(value.as_mut(), &self.stale))?.ok();
+                         fun(value.cloned_err(), &self.stale))?.ok();
             },
             State::Taken => {
-                fun(self.value.as_mut(), &self.stale)?;
+                fun(self.value.cloned_err(), &self.stale)?;
             },
         }
 
@@ -517,31 +519,15 @@ impl Stale {
     }
 }
 
-trait ResultRefConvert<T> {
-    fn convert(&self) -> Result<&T, &Error>;
+trait ClonedErr<T> {
+    fn cloned_err(&mut self) -> Result<&mut T, AError>;
 }
 
-impl<T> ResultRefConvert<T> for &CResult<T> {
-    fn convert(&self) -> Result<&T, &Error> {
+impl<T> ClonedErr<T> for Result<T, AError> {
+    fn cloned_err(&mut self) -> Result<&mut T, AError> {
         match self {
-            Ok(value) => Ok(&value),
-            Err(err) => {
-                let err = err.clone();
-                Err(err)
-            }
-        }
-    }
-}
-
-trait ResultRefMutConvert<T> {
-    fn convert(&mut self) -> Result<&mut T, &Error>;
-}
-
-impl<T> ResultRefMutConvert<T> for &mut CResult<T> {
-    fn convert(&mut self) -> Result<&mut T, &Error> {
-        match self {
-            Ok(value) => Ok(value),
-            Err(err) => Err(err)
+            Ok(ref mut val) => Ok(val),
+            Err(err) => Err(err.clone())
         }
     }
 }
