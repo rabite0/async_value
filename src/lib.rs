@@ -2,20 +2,14 @@ extern crate failure;
 extern crate rayon;
 #[macro_use]
 extern crate lazy_static;
-extern crate objekt;
-
-
 
 
 use std::sync::RwLock;
 use std::sync::Mutex;
 use std::sync::Arc;
 
-use std::ops::Deref;
-
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use failure::{Fail, Error};
-use failure::Backtrace;
 
 
 
@@ -27,65 +21,29 @@ lazy_static! {
 }
 
 
-#[derive(Debug, Clone)]
-pub struct ArcBacktrace(Arc<Backtrace>);
-
-impl ArcBacktrace {
-    fn new() -> Self {
-        let bt = Arc::new(Backtrace::new());
-        ArcBacktrace(bt)
-    }
-    fn backtrace(&self) -> Option<&Backtrace> {
-        Some(self.0.deref())
-    }
-}
-
-
-
-
-#[derive(Debug, Clone)]
+#[derive(Fail, Debug, Clone)]
 pub enum AError {
     AsyncNotStarted,
-    AsyncNotReady(ArcBacktrace),
-    AsyncRunning(ArcBacktrace),
-    AsyncFailed(ArcBacktrace),
-    AsyncStale(ArcBacktrace),
-    AsyncValuePulled(ArcBacktrace),
-    AsyncValueMoved(ArcBacktrace),
-    AsyncValueEmpty(ArcBacktrace),
-    NoValueFn(ArcBacktrace),
-    NoReadyFn(ArcBacktrace),
-    MutexPoisoned(ArcBacktrace),
-    NoThreadPool(ArcBacktrace),
-    OtherError(ArcBacktrace, Arc<Error>)
+    AsyncNotReady,
+    AsyncRunning,
+    AsyncFailed,
+    AsyncStale,
+    AsyncValuePulled,
+    AsyncValueMoved,
+    AsyncValueEmpty,
+    NoValueFn,
+    NoReadyFn,
+    MutexPoisoned,
+    NoThreadPool,
+    OtherError(Arc<Error>)
 }
 
 impl From<Error> for AError {
     fn from(err: Error) -> Self {
-        AError::OtherError(ArcBacktrace::new(),
-                           Arc::new(err))
+        AError::OtherError(Arc::new(err))
     }
 }
 
-impl Fail for AError {
-    fn backtrace(&self) -> Option<&Backtrace> {
-        match self {
-            AError::AsyncNotStarted => None,
-            AError::AsyncNotReady(bt) => bt.backtrace(),
-            AError::AsyncRunning(bt) => bt.backtrace(),
-            AError::AsyncFailed(bt) => bt.backtrace(),
-            AError::AsyncStale(bt) => bt.backtrace(),
-            AError::AsyncValuePulled(bt) => bt.backtrace(),
-            AError::AsyncValueMoved(bt) => bt.backtrace(),
-            AError::AsyncValueEmpty(bt) => bt.backtrace(),
-            AError::NoValueFn(bt) => bt.backtrace(),
-            AError::NoReadyFn(bt) => bt.backtrace(),
-            AError::MutexPoisoned(bt) => bt.backtrace(),
-            AError::NoThreadPool(bt) => bt.backtrace(),
-            AError::OtherError(bt, _) => bt.backtrace()
-        }
-    }
-}
 
 impl std::fmt::Display for AError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -95,7 +53,7 @@ impl std::fmt::Display for AError {
 
 impl<T> From<std::sync::PoisonError<T>> for AError {
     fn from(_: std::sync::PoisonError<T>) -> Self {
-        let err = AError::MutexPoisoned(ArcBacktrace::new());
+        let err = AError::MutexPoisoned;
         err
     }
 }
@@ -103,34 +61,34 @@ impl<T> From<std::sync::PoisonError<T>> for AError {
 
 impl AError {
     pub fn async_not_ready() -> AError {
-        AError::AsyncNotReady(ArcBacktrace::new())
+        AError::AsyncNotReady
     }
     pub fn async_running() -> AError {
-        AError::AsyncRunning(ArcBacktrace::new())
+        AError::AsyncRunning
     }
     pub fn async_pulled() -> AError {
-        AError::AsyncValuePulled(ArcBacktrace::new())
+        AError::AsyncValuePulled
     }
     pub fn async_moved() -> AError {
-        AError::AsyncValueMoved(ArcBacktrace::new())
+        AError::AsyncValueMoved
     }
     pub fn async_empty() -> AError {
-        AError::AsyncValueEmpty(ArcBacktrace::new())
+        AError::AsyncValueEmpty
     }
     pub fn async_stale() -> AError {
-        AError::AsyncStale(ArcBacktrace::new())
+        AError::AsyncStale
     }
     pub fn no_value_fn() -> AError {
-        AError::NoValueFn(ArcBacktrace::new())
+        AError::NoValueFn
     }
     pub fn no_ready_fn() -> AError {
-        AError::NoValueFn(ArcBacktrace::new())
+        AError::NoValueFn
     }
     pub fn mutex_poisoned() -> AError {
-        AError::MutexPoisoned(ArcBacktrace::new())
+        AError::MutexPoisoned
     }
     pub fn no_thread_pool() -> AError {
-        AError::NoThreadPool(ArcBacktrace::new())
+        AError::NoThreadPool
     }
 }
 
@@ -424,7 +382,7 @@ impl<T: Send + 'static> Async<T>
                     .unwrap_or_else(|| Err(AError::async_empty()));
                 self.value = value;
             }
-            Some(Err(AError::AsyncValuePulled(_)))
+            Some(Err(AError::AsyncValuePulled))
                 => Err(AError::async_pulled())?,
             Some(Err(_)) => {
                 let value = async_value.take()
