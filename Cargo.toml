@@ -2,6 +2,8 @@
 name = "async_value"
 description = "Simple, persistent, asynchronous values"
 version = "0.2.2"
+homepage = "https://github.com/rabite0/async_value"
+repository = "https://github.com/rabite0/async_value"
 authors = ["rabite <rabite@posteo.de>"]
 edition = "2018"
 license = "WTFPL"
