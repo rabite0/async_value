@@ -104,8 +104,30 @@ pub type AsyncReadyFn<T> = FnOnce(Result<&mut T,
                                   &Stale)
                                   -> CResult<()> + Send + 'static;
 
+use std::fmt::Debug;
+impl<T: Send + Debug> Debug for Async<T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(),std::fmt::Error> {
+        write!(fmt, "{:?}", self.value)?;
+        write!(fmt, "{:?}", self.async_value)?;
+        write!(fmt, "{:?}", self.state)?;
+        write!(fmt, "{:?}", self.stale)?;
 
+        let async_closure = self.async_closure
+            .try_lock()
+            .map(|clos| format!("{:?}", clos.is_some()))
+            .map_err(|e| format!("{:?}", e));
 
+        let on_ready = self.on_ready
+            .try_lock()
+            .map(|clos| format!("On ready clsoruses: {}", clos.len()))
+            .map_err(|e| format!("{:?}", e));
+
+        write!(fmt, "{:?}", async_closure)?;
+        write!(fmt, "{:?}", on_ready)?;
+
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct Async<T: Send + 'static>
