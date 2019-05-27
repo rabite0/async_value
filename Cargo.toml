@@ -1,7 +1,7 @@
 [package]
 name = "async_value"
 description = "Simple, persistent, asynchronous values"
-version = "0.2.3"
+version = "0.2.4"
 homepage = "https://github.com/rabite0/async_value"
 repository = "https://github.com/rabite0/async_value"
 authors = ["rabite <rabite@posteo.de>"]
