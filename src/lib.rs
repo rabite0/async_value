@@ -393,9 +393,7 @@ impl<T: Send + 'static> Async<T>
     pub fn pull_async(&mut self) -> AResult<()> {
         if self.value.is_ok() { Err(AError::async_pulled())? }
 
-
-        let mut async_value = self.async_value.try_lock()
-            .map_err(|_| AError::async_not_ready() )?;
+        let mut async_value = self.async_value.lock()?;
 
 
         match async_value.as_ref() {
