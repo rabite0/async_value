@@ -98,11 +98,11 @@ pub type CResult<T> = Result<T, Error>;
 
 pub type AsyncValue<T> = Arc<Mutex<Option<AResult<T>>>>;
 
-pub type AsyncValueFn<T> = FnOnce(&Stale) -> CResult<T> + Send + 'static;
-pub type AsyncReadyFn<T> = FnOnce(Result<&mut T,
-                                         AError>,
-                                  &Stale)
-                                  -> CResult<()> + Send + 'static;
+pub type AsyncValueFn<T> = dyn FnOnce(&Stale) -> CResult<T> + Send + 'static;
+pub type AsyncReadyFn<T> = dyn FnOnce(Result<&mut T,
+                                             AError>,
+                                      &Stale)
+                                      -> CResult<()> + Send + 'static;
 
 use std::fmt::Debug;
 impl<T: Send + Debug> Debug for Async<T> {
