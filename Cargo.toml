@@ -1,7 +1,7 @@
 [package]
 name = "async_value"
 description = "Simple, persistent, asynchronous values"
-version = "0.2.5"
+version = "0.2.6"
 homepage = "https://github.com/rabite0/async_value"
 repository = "https://github.com/rabite0/async_value"
 authors = ["rabite <rabite@posteo.de>"]
@@ -9,7 +9,7 @@ edition = "2018"
 license = "WTFPL"
 
 [dependencies]
-rayon = "1.0"
+rayon = "1"
 failure = "0.1"
 failure_derive = "0.1"
 lazy_static = "1"
