@@ -129,6 +129,48 @@ impl<T: Send + Debug> Debug for Async<T> {
     }
 }
 
+use std::iter::Fuse;
+pub struct StoppableIterator<I: Iterator> {
+    iter: Fuse<I>,
+    stale: Stale,
+}
+
+impl<I: Iterator> StoppableIterator<I> {
+    fn stale(&self) -> bool {
+        self.stale
+            .is_stale()
+            .unwrap_or(true)
+    }
+}
+
+impl<I: Iterator> Iterator for StoppableIterator<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        // If stale return None, Fuse takes care of the rest
+        if self.stale() {
+            return None;
+        }
+
+        self.iter.next()
+    }
+}
+
+pub trait StopIter {
+    fn stop_stale(self, stale: Stale) -> StoppableIterator<Self>
+    where
+        Self: Iterator + Sized;
+}
+
+impl<I: Iterator> StopIter for I {
+    fn stop_stale(self, stale: Stale) -> StoppableIterator<Self> {
+        StoppableIterator {
+            iter: self.fuse(),
+            stale: stale
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Async<T: Send + 'static>
 {
